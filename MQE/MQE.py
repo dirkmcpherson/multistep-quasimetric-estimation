@@ -1,5 +1,6 @@
 from __future__ import annotations
-from math import log
+from math import log, sqrt
+from copy import deepcopy
 from functools import partial, wraps
 
 import torch
@@ -120,7 +121,8 @@ class MetricResidualNetwork(Module):
         *,
         sym_network: Module,
         asym_network: Module,
-        distance_groups = 8
+        distance_groups = 8,
+        normalize_by_dim = True
     ):
         super().__init__()
 
@@ -132,6 +134,10 @@ class MetricResidualNetwork(Module):
         # distance related
 
         self.distance_groups = distance_groups
+
+        # the authors' released code divides the mrn distance by sqrt(latent_dim), which keeps initial distances (and the linex residuals) small
+
+        self.normalize_by_dim = normalize_by_dim
 
     def forward(
         self,
@@ -150,6 +156,9 @@ class MetricResidualNetwork(Module):
         sym_x, sym_y, asym_x, asym_y = (rearrange(t, '... (g d) -> ... g d', g = self.distance_groups) for t in (sym_x, sym_y, asym_x, asym_y))
 
         distance = quasimetric_distance(sym_x, sym_y, asym_x, asym_y)
+
+        if self.normalize_by_dim:
+            distance = distance / sqrt(dim_embed)
 
         if not reduce_groups:
             return distance
@@ -185,71 +194,27 @@ class Critic(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
-    def extract_policy(
-        self,
-        policy: Module,
-        states,
-        actions,
-        goals,
-        bc_loss_weight = 0.1,
-        is_image = False,
-        lens = None
-    ):
-        # extracts goal-conditioned policy using behavior-regularization
+    def extract_policy(self, policy: Module, states, actions, goals, **kwargs):
+        return extract_policy_loss([self], policy, states, actions, goals, **kwargs)
 
-        batch, device = states.shape[0], states.device
-
-        is_seq = states.ndim == (5 if is_image else 3)
-
-        if is_seq:
-            lens = check_lens(lens, states)
-
-            if goals.ndim == states.ndim:
-                goals = batched_index_select(goals, lens - 1) if exists(lens) else goals[:, -1]
-
-            states = states[:, 0]
-            actions = actions[:, 0]
-
-        # behavior cloning loss
-
-        action_dist = policy(states, goals)
-
-        bc_loss = self.zero
-
-        if bc_loss_weight > 0.:
-            log_prob = action_dist.log_prob(actions)
-            log_prob = reduce(log_prob, 'b ... -> b', 'sum')
-            bc_loss = -log_prob.mean()
-
-        # minimize distance is the same as maximizing Q
-
-        rand_indices = torch.randperm(batch, device = device)
-        goals_j = goals[rand_indices]
-
-        action_dist_j = policy(states, goals_j)
-        pred_actions_j = action_dist_j.rsample()
-
-        q_loss = self.actor_loss(states, pred_actions_j, goals_j)
-
-        total_loss = q_loss + bc_loss_weight * bc_loss
-
-        return total_loss, (q_loss, bc_loss)
-
-    def actor_loss(
+    def actor_distance(
         self,
         states,
         actions,
         goals
     ):
+        # d((s, a), g) per sample, used as -Q by the actor
+
         encoded_state_actions = self.state_action_encoder((states, actions))
         encoded_goals = self.state_encoder(goals)
 
-        dist_q_to_goal = self.metric_residual_network(
+        return self.metric_residual_network(
             encoded_state_actions,
             encoded_goals
         )
 
-        return dist_q_to_goal.mean()
+    def actor_loss(self, states, actions, goals):
+        return self.actor_distance(states, actions, goals).mean()
 
     # predicting distances
 
@@ -331,7 +296,85 @@ class Critic(Module):
 
         return total_loss, (loss, loss_action_invariance)
 
-# main classe
+# policy extraction - behavior-regularized ddpg (ddpg + bc), following the authors' released code
+# https://github.com/WJ2003B/mqe-release/blob/main/impls/agents/mqe.py
+
+def extract_policy_loss(
+    critics,
+    policy: Module,
+    states,
+    actions,
+    goals,
+    bc_loss_weight = 0.1,
+    is_image = False,
+    lens = None,
+    cross_batch_goals = False,   # eq. 15 of the paper permutes goals across the batch for the q term; the authors' code uses the same (future, same-trajectory) goal as the bc term
+    normalize_q = True,          # divide the q term by its detached mean magnitude so bc_loss_weight is on ogbench's ddpg+bc scale
+    use_mean_action = True,      # evaluate q at the distribution mean (the authors use a constant-std actor and its mode); otherwise rsample
+    action_clamp = None          # e.g. (-1., 1.) to clip the q-term action to the action bounds, as the authors do
+):
+    batch, device = states.shape[0], states.device
+
+    is_seq = states.ndim == (5 if is_image else 3)
+
+    if is_seq:
+        lens = check_lens(lens, states)
+
+        if goals.ndim == states.ndim:
+            goals = batched_index_select(goals, lens - 1) if exists(lens) else goals[:, -1]
+
+        states = states[:, 0]
+        actions = actions[:, 0]
+
+    # behavior cloning loss
+
+    action_dist = policy(states, goals)
+
+    bc_loss = states.new_zeros(())
+
+    if bc_loss_weight > 0.:
+        log_prob = action_dist.log_prob(actions)
+        log_prob = reduce(log_prob, 'b ... -> b', 'sum')
+        bc_loss = -log_prob.mean()
+
+    # q term - minimizing the distance is maximizing q
+
+    if cross_batch_goals:
+        goals_q = goals[torch.randperm(batch, device = device)]
+        action_dist_q = policy(states, goals_q)
+    else:
+        goals_q, action_dist_q = goals, action_dist
+
+    if use_mean_action and hasattr(action_dist_q, 'mean'):
+        pred_actions = action_dist_q.mean
+    else:
+        pred_actions = action_dist_q.rsample()
+
+    if exists(action_clamp):
+        pred_actions = pred_actions.clamp(*action_clamp)
+
+    # pessimistic over the critic ensemble: min q = max distance
+
+    dist = torch.stack([critic.actor_distance(states, pred_actions, goals_q) for critic in critics]).amax(dim = 0)
+
+    if normalize_q:
+        dist = dist / (dist.abs().mean().detach() + 1e-6)
+
+    q_loss = dist.mean()
+
+    total_loss = q_loss + bc_loss_weight * bc_loss
+
+    return total_loss, (q_loss, bc_loss)
+
+# helpers for the critic ensemble
+
+def reinit_(module: Module):
+    for m in module.modules():
+        if hasattr(m, 'reset_parameters'):
+            m.reset_parameters()
+    return module
+
+# main class
 
 class MultistepQuasimetricEstimation(Module):
     def __init__(
@@ -344,30 +387,52 @@ class MultistepQuasimetricEstimation(Module):
         max_waypoint_dist = None,
         next_timestep_prob = 0.2,
         action_invariance_loss_weight = 1.,
-        paired_loss_weight = 0.5
+        paired_loss_weight = 0.5,
+        critic_ensemble = 2
     ):
         super().__init__()
 
-        self.critic = Critic(
-            state_encoder = state_encoder,
-            state_action_encoder = state_action_encoder,
-            metric_residual_network = metric_residual_network,
-            discount_factor = discount_factor,
-            action_invariance_loss_weight = action_invariance_loss_weight,
-            paired_loss_weight = paired_loss_weight
-        )
+        # the authors train an ensemble of 2 critics (independently initialised copies) and take the pessimistic one for the actor
+        # additional members are deep copies of the given networks with their parameters re-initialised
+
+        def make_critic(state_encoder, state_action_encoder, metric_residual_network):
+            return Critic(
+                state_encoder = state_encoder,
+                state_action_encoder = state_action_encoder,
+                metric_residual_network = metric_residual_network,
+                discount_factor = discount_factor,
+                action_invariance_loss_weight = action_invariance_loss_weight,
+                paired_loss_weight = paired_loss_weight
+            )
+
+        assert critic_ensemble >= 1
+
+        critics = [make_critic(state_encoder, state_action_encoder, metric_residual_network)]
+
+        for _ in range(critic_ensemble - 1):
+            critics.append(make_critic(*[reinit_(deepcopy(net)) for net in (state_encoder, state_action_encoder, metric_residual_network)]))
+
+        self.critics = nn.ModuleList(critics)
 
         self.max_waypoint_dist = max_waypoint_dist
         self.waypoint_discount = waypoint_discount
         self.discount_factor = discount_factor
         self.next_timestep_prob = next_timestep_prob
 
+    @property
+    def critic(self):
+        # first ensemble member, kept for backwards compatibility
+        return self.critics[0]
+
     def extract_policy(
         self,
-        *args,
+        policy,
+        states,
+        actions,
+        goals,
         **kwargs
     ):
-        return self.critic.extract_policy(*args, **kwargs)
+        return extract_policy_loss(list(self.critics), policy, states, actions, goals, **kwargs)
 
     # predicting distance and steps
 
@@ -375,9 +440,15 @@ class MultistepQuasimetricEstimation(Module):
         self,
         *args,
         return_steps = False,
+        ensemble_reduce = 'mean',  # 'mean' | 'max' (pessimistic) | None (stack over members)
         **kwargs
     ):
-        dist = self.critic.predict_distance(*args, **kwargs)
+        dist = torch.stack([critic.predict_distance(*args, **kwargs) for critic in self.critics])
+
+        if ensemble_reduce == 'mean':
+            dist = dist.mean(dim = 0)
+        elif ensemble_reduce == 'max':
+            dist = dist.amax(dim = 0)
 
         if not return_steps:
             return dist
@@ -416,7 +487,9 @@ class MultistepQuasimetricEstimation(Module):
 
         # eq. (8) of the paper - waypoint distance capped at the goal distance K, where the goal is the last frame of the trajectory window (k' ~ min(geometric(1 - lambda), K))
 
-        k_prime = torch.empty((batch,), device = device).geometric_(1. - self.waypoint_discount).long()
+        # note: on cuda, geometric_ can return 0 (curand uniform includes 1.), so clamp to the documented support {1, 2, ...}
+
+        k_prime = torch.empty((batch,), device = device).geometric_(1. - self.waypoint_discount).long().clamp(min = 1)
         waypoint_dist = k_prime.clamp(max = max_waypoint)
         waypoint_dist = torch.where(is_next_timestep, 1, waypoint_dist)
 
@@ -429,7 +502,15 @@ class MultistepQuasimetricEstimation(Module):
         if goals.ndim == states.ndim:
             goals = batched_index_select(goals, lens - 1) if exists(lens) else goals[:, -1]
 
-        return self.critic(states[:, 0], actions[:, 0], goals, waypoints, waypoint_dist)
+        # same batch, waypoints and goals for every ensemble member, losses summed
+
+        total_loss, total_multistep, total_invariance = 0., 0., 0.
+
+        for critic in self.critics:
+            loss, (multistep_loss, invariance_loss) = critic(states[:, 0], actions[:, 0], goals, waypoints, waypoint_dist)
+            total_loss, total_multistep, total_invariance = total_loss + loss, total_multistep + multistep_loss, total_invariance + invariance_loss
+
+        return total_loss, (total_multistep, total_invariance)
 
 # shorthand
 

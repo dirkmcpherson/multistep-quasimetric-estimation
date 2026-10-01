@@ -229,3 +229,60 @@ def test_predict_distance():
 
     steps = mqe.predict_distance(states[:, 0], states[:, -1], return_steps = True)
     assert steps.shape == (4,)
+
+def test_critic_ensemble_and_policy_extraction_options():
+    from x_mlps_pytorch import MLP
+    from MQE import MQE, MRN, ContinuousAction
+
+    dim_state, dim_action = 16, 4
+
+    mqe = MQE(
+        state_encoder = MLP(dim_state, 32, 16),
+        state_action_encoder = MLP(dim_state + dim_action, 32, 16),
+        metric_residual_network = MRN(
+            sym_network = MLP(16, 32),
+            asym_network = MLP(16, 32),
+            normalize_by_dim = True
+        ),
+        critic_ensemble = 2
+    )
+
+    assert len(mqe.critics) == 2
+
+    # ensemble members are independently initialised copies
+    p0, p1 = mqe.critics[0].state_encoder.layers[0][0].weight, mqe.critics[1].state_encoder.layers[0][0].weight
+    assert p0.shape == p1.shape and not torch.allclose(p0, p1)
+
+    states = torch.randn(4, 10, dim_state)
+    actions = torch.rand(4, 10, dim_action)
+
+    loss, (multistep, invariance) = mqe(states, actions)
+    loss.backward()
+    assert all(exists(p.grad) for c in mqe.critics for p in c.parameters())
+
+    # predict_distance reduces over the ensemble by default; None stacks members
+    assert mqe.predict_distance(states[:, 0], states[:, -1]).shape == (4,)
+    assert mqe.predict_distance(states[:, 0], states[:, -1], ensemble_reduce = None).shape == (2, 4)
+
+    class DummyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = MLP(dim_state * 2, dim_action * 2)
+
+        def forward(self, state, goal):
+            mean, log_std = self.net(torch.cat((state, goal), dim = -1)).chunk(2, dim = -1)
+            return ContinuousAction()(torch.cat((mean, log_std), dim = -1))
+
+    policy = DummyPolicy()
+    s, g, a = states[:, 0], states[:, -1], actions[:, 0]
+
+    # default (authors' code): paired goals, normalized q, mean action
+    total, (q_loss, bc_loss) = mqe.extract_policy(policy, s, a, g, bc_loss_weight = 1.0, action_clamp = (-1., 1.))
+    assert torch.isclose(q_loss, torch.tensor(1.), atol = 1e-4), 'normalized q term has unit mean magnitude'
+    total.backward()
+    assert any(exists(p.grad) for p in policy.parameters())
+
+    # pre-branch behaviour: cross-batch goals, raw distances, sampled actions
+    total, (q_loss, bc_loss) = mqe.extract_policy(policy, s, a, g, cross_batch_goals = True, normalize_q = False, use_mean_action = False)
+    assert q_loss > 0
+    total.backward()

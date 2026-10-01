@@ -32,7 +32,8 @@ mrn = MRN(
 mqe = MQE(
     state_encoder = MLP(state_dim, 32),
     state_action_encoder = MLP(state_dim + action_dim, 32),
-    metric_residual_network = mrn
+    metric_residual_network = mrn,
+    critic_ensemble = 2        # as in the authors' code; extra members are re-initialised deep copies of the networks above
 )
 
 policy = Policy(
@@ -53,15 +54,20 @@ critic_loss, _ = mqe(states, actions, goals)
 
 critic_loss.backward()
 
-# train actor using critic
+# train actor using critic (ddpg + bc, following the authors' released code: same-trajectory goals,
+# q term normalized by its mean magnitude, pessimistic over the critic ensemble, action taken at the distribution mean)
 
 policy_loss, _ = mqe.extract_policy(
     policy,
     states,
     actions,
     goals,
-    bc_loss_weight = 0.1
+    bc_loss_weight = 0.1,
+    action_clamp = (-1., 1.)   # clip the q-term action to the action bounds
 )
+
+# the paper's eq. 15 (goals permuted across the batch, raw distances) is still available:
+#   mqe.extract_policy(..., cross_batch_goals = True, normalize_q = False, use_mean_action = False)
 
 policy_loss.backward()
 
@@ -69,6 +75,10 @@ policy_loss.backward()
 
 action = policy(states[:, 0], goals[:, 0]).sample() # (4, 4)
 ```
+
+## Matching the authors' released implementation
+
+Three details that matter for policy extraction were taken from the authors' released code ([mqe-release](https://github.com/WJ2003B/mqe-release)) and are now the defaults: the MRN distance is divided by `sqrt(latent_dim)` (`MRN(normalize_by_dim = True)`), two critics are trained and the actor uses the pessimistic one (`MQE(critic_ensemble = 2)`), and `extract_policy` uses the same-trajectory goal for the Q term with the Q term normalized by its mean magnitude. On OGBench `cube-single-play-v0` these change the extracted policy from below behavior cloning (3%) to the level of the authors' code (17% vs 20%, one seed each); see `examples/ogbench_mqe.py` for the full training and evaluation script and `runs/REPORT.md` for the comparison.
 
 ## Citations
 
