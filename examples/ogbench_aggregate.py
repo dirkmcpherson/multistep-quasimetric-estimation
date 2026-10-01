@@ -20,6 +20,9 @@ PAPER = {
     'antmaze-giant-stitch-v0': (35.1, 9.2, 'TMD', 2.7),
     # cube-single-play is not in the MQE paper; baselines from the OGBench paper (arXiv 2410.20092) table 2: GCBC 6, GCIVL 53, GCIQL 68, QRL 5, CRL 19, HIQL 15
     'cube-single-play-v0': (float('nan'), 68.0, 'GCIQL (OGBench paper)', 6.0),
+    # maniskill: no published goal-conditioned numbers; final = mean of the last three evaluations of the 300k schedule
+    'maniskill-pickcube-play-v0': (float('nan'), float('nan'), 'n/a', float('nan')),
+    'maniskill-pushcube-play-v0': (float('nan'), float('nan'), 'n/a', float('nan')),
 }
 FINAL_STEPS = (800_000, 900_000, 1_000_000)
 
@@ -65,7 +68,7 @@ def main(runs_dir = 'runs'):
             finals = []
             for seed, c in arm.get(env, {}).items():
                 row = [f'{c[s] * 100:.1f}' if s in c else '-' for s in steps]
-                fin = [c[s] for s in FINAL_STEPS if s in c]
+                fin = [c[s] for s in FINAL_STEPS if s in c] if not env.startswith('maniskill') else [c[s] for s in sorted(c)[-3:]]
                 final = f'{np.mean(fin) * 100:.1f}' if len(fin) == 3 else ('(partial) ' + f'{np.mean(fin) * 100:.1f}' if fin else '-')
                 if len(fin) == 3:
                     finals.append(np.mean(fin) * 100)

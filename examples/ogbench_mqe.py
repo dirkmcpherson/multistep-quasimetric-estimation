@@ -204,6 +204,12 @@ def main(
 ):
     import ogbench
 
+    if env_name.startswith('maniskill'):
+        # registers the goal-conditioned maniskill envs and expects the converted datasets in ~/.ogbench/data (see examples/maniskill_gc.py)
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import maniskill_gc  # noqa: F401
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -215,7 +221,8 @@ def main(
         'latent_dim', 'hidden_dim', 'distance_groups', 'paired_loss_weight', 'action_invariance_loss_weight', 'eval_episodes', 'q_normalize', 'ensemble', 'mrn_normalize_by_dim', 'actor_goal', 'actor_final_init_scale', 'gcbc')}
     (out_dir / 'config.json').write_text(json.dumps(config, indent = 2))
 
-    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True)
+    import os
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True, dataset_dir = os.environ.get('OGBENCH_DATA_DIR', '~/.ogbench/data'))
     data = GPUDataset(train_dataset, device)
     obs_dim, action_dim = data.obs_dim, data.action_dim
     print(f'{env_name}: {len(data.obs)} states, {data.num_episodes} episodes, obs {obs_dim}, act {action_dim}')
@@ -339,7 +346,8 @@ def main(
 
     log_file.close()
 
-    final = [r['overall'] for r in eval_results if r['step'] in (800_000, 900_000, 1_000_000)]
+    # protocol number: mean of the last three evaluations (800k / 900k / 1M on the paper's schedule)
+    final = [r['overall'] for r in eval_results[-3:]]
     summary = dict(config = config, eval = eval_results, final_success = float(np.mean(final)) if final else None)
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent = 2))
     print(f'final success (mean of 800k/900k/1M): {summary["final_success"]}')

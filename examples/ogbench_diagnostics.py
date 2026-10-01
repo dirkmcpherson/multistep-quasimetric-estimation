@@ -82,7 +82,10 @@ def main(
     config = state['config']
     env_name = config['env_name']
 
-    _, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True, dataset_only = True)
+    import os
+    if env_name.startswith('maniskill'):
+        import maniskill_gc  # noqa: F401
+    _, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True, dataset_only = True, dataset_dir = os.environ.get('OGBENCH_DATA_DIR', '~/.ogbench/data'))
     data = GPUDataset(val_dataset, device)
 
     mqe = build_mqe(config, data.obs_dim, data.action_dim).to(device)
