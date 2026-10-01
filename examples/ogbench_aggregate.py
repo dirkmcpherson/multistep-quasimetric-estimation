@@ -2,7 +2,8 @@
 
 arms:
   raw        runs/<env>/seed*/eval.json            repo as written
-  faithful   runs/faithful/<env>/seed*/eval.json   repo critic + actor matching the authors' code
+  faithful   runs/faithful/<env>/seed*/eval.json   repo critic + actor matching the authors' code (harness-side, pre-branch)
+  branch     runs/branch/<env>/seed*/eval.json     match-authors-actor branch, library defaults
   reference  runs/reference/OGBench/<env>/*/eval.csv   the authors' jax implementation
 """
 
@@ -45,6 +46,7 @@ def collect(runs_dir):
     for env in PAPER:
         arms.setdefault('raw', {})[env] = {d.name: c for d in sorted((runs_dir / env).glob('seed*')) if (c := load_harness_curve(d))} if (runs_dir / env).exists() else {}
         arms.setdefault('faithful', {})[env] = {d.name: c for d in sorted((runs_dir / 'faithful' / env).glob('seed*')) if (c := load_harness_curve(d))} if (runs_dir / 'faithful' / env).exists() else {}
+        arms.setdefault('branch', {})[env] = {d.name: c for d in sorted((runs_dir / 'branch' / env).glob('seed*')) if (c := load_harness_curve(d))} if (runs_dir / 'branch' / env).exists() else {}
         arms.setdefault('gcbc', {})[env] = {d.name: c for d in sorted((runs_dir / 'gcbc' / env).glob('seed*')) if (c := load_harness_curve(d))} if (runs_dir / 'gcbc' / env).exists() else {}
         ref_dir = runs_dir / 'reference' / 'OGBench' / env
         arms.setdefault('reference', {})[env] = {f'seed{i}': c for i, d in enumerate(sorted(ref_dir.glob('*'))) if (c := load_reference_curve(d))} if ref_dir.exists() else {}
