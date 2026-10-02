@@ -97,7 +97,7 @@ class GoalConditionedPolicy(nn.Module):
 # dataset on gpu with trajectory-window sampling
 
 class GPUDataset:
-    def __init__(self, dataset, device):
+    def __init__(self, dataset, device, segment_len = None):
         obs = torch.from_numpy(dataset['observations']).to(device)
         acts = torch.from_numpy(dataset['actions']).to(device)
         valids = torch.from_numpy(dataset['valids']).to(device).bool()
@@ -107,16 +107,30 @@ class GPUDataset:
         final_idxs = torch.nonzero(~valids).squeeze(-1)
         ep_end = torch.empty(len(obs), dtype = torch.long, device = device)
         start = 0
+        ep_start = torch.empty(len(obs), dtype = torch.long, device = device)
         for e in final_idxs.tolist():
             ep_end[start:e + 1] = e
+            ep_start[start:e + 1] = start
             start = e + 1
 
+        # stitching test: cut every trajectory into windows of `segment_len` transitions.
+        # adjacent windows share their boundary state (window j covers states s + jL .. s + (j + 1)L),
+        # and every sampled waypoint / goal is restricted to the window its start state begins, so no
+        # training signal spans more than `segment_len` steps
+
+        if segment_len is not None:
+            idx = torch.arange(len(obs), device = device)
+            chunk_end = ep_start + ((idx - ep_start) // segment_len + 1) * segment_len
+            ep_end = torch.minimum(chunk_end, ep_end)
+
         self.obs, self.acts, self.ep_end = obs, acts, ep_end
+        self.segment_len = segment_len
         self.valid_idxs = torch.nonzero(valids).squeeze(-1)
         self.max_window = int((ep_end[self.valid_idxs] - self.valid_idxs).max()) + 1
         self.device = device
         self.obs_dim, self.action_dim = obs.shape[-1], acts.shape[-1]
         self.num_episodes = len(final_idxs)
+        self.num_segments = int((self.ep_end[self.valid_idxs].unique()).numel())
 
     def sample_starts(self, batch):
         return self.valid_idxs[torch.randint(0, len(self.valid_idxs), (batch,), device = self.device)]
@@ -204,7 +218,8 @@ def main(
     actor_goal = 'paired',         # 'paired': same-trajectory future goal for the q term (authors' code); 'random': goals permuted across the batch (eq. 15 / pre-branch repo)
     actor_final_init_scale = 0.01, # small init of the actor's mean layer (authors' code); None for the default init
     gcbc = False,                  # goal-conditioned behavior cloning baseline: actor trained with the bc term only, critic not trained
-    normalize_actions = False      # standardize each action dimension by its dataset mean / std for training; the policy is un-normalized at execution
+    normalize_actions = False,     # standardize each action dimension by its dataset mean / std for training; the policy is un-normalized at execution
+    segment_len = None             # stitching test: train only on windows of this many transitions cut from each trajectory (None = full trajectories)
 ):
     import ogbench
 
@@ -222,12 +237,12 @@ def main(
 
     config = {k: v for k, v in locals().items() if k in (
         'env_name', 'seed', 'alpha', 'steps', 'batch_size', 'lr', 'discount', 'waypoint_discount', 'next_timestep_prob',
-        'latent_dim', 'hidden_dim', 'distance_groups', 'paired_loss_weight', 'action_invariance_loss_weight', 'eval_episodes', 'q_normalize', 'ensemble', 'mrn_normalize_by_dim', 'actor_goal', 'actor_final_init_scale', 'gcbc', 'normalize_actions')}
+        'latent_dim', 'hidden_dim', 'distance_groups', 'paired_loss_weight', 'action_invariance_loss_weight', 'eval_episodes', 'q_normalize', 'ensemble', 'mrn_normalize_by_dim', 'actor_goal', 'actor_final_init_scale', 'gcbc', 'normalize_actions', 'segment_len')}
     (out_dir / 'config.json').write_text(json.dumps(config, indent = 2))
 
     import os
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True, dataset_dir = os.environ.get('OGBENCH_DATA_DIR', '~/.ogbench/data'))
-    data = GPUDataset(train_dataset, device)
+    data = GPUDataset(train_dataset, device, segment_len = segment_len)
     obs_dim, action_dim = data.obs_dim, data.action_dim
 
     # optional per-dimension action standardization (statistics over transitions that have an action)
@@ -242,7 +257,7 @@ def main(
         data.acts = (data.acts - act_mean) / act_std
         q_action_clamp = ((-1. - act_mean) / act_std, (1. - act_mean) / act_std)   # the env's [-1, 1] bounds in normalized space
         print('action mean', [round(v, 3) for v in act_mean.tolist()], 'std', [round(v, 3) for v in act_std.tolist()])
-    print(f'{env_name}: {len(data.obs)} states, {data.num_episodes} episodes, obs {obs_dim}, act {action_dim}')
+    print(f'{env_name}: {len(data.obs)} states, {data.num_episodes} episodes, {data.num_segments} training segments (segment_len {segment_len}), obs {obs_dim}, act {action_dim}')
 
     mqe = MQE(
         state_encoder = EncoderMLP(obs_dim, latent_dim, hidden_dim),
