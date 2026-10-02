@@ -87,6 +87,8 @@ def main(
         import maniskill_gc  # noqa: F401
     _, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True, dataset_only = True, dataset_dir = os.environ.get('OGBENCH_DATA_DIR', '~/.ogbench/data'))
     data = GPUDataset(val_dataset, device)
+    if state.get('act_mean') is not None:
+        data.acts = (data.acts - state['act_mean'].to(device)) / state['act_std'].to(device)
 
     mqe = build_mqe(config, data.obs_dim, data.action_dim).to(device)
 

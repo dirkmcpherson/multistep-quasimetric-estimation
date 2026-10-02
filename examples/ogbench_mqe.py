@@ -147,7 +147,7 @@ class GPUDataset:
 # evaluation following ogbench
 
 @torch.no_grad()
-def evaluate(env, policy, device, num_episodes, num_tasks = 5):
+def evaluate(env, policy, device, num_episodes, num_tasks = 5, act_mean = None, act_std = None):
     # single-observation inference is faster on cpu than on a busy gpu, so evaluate a cpu copy
 
     import copy
@@ -163,7 +163,10 @@ def evaluate(env, policy, device, num_episodes, num_tasks = 5):
             success = 0.
             while not done:
                 state = torch.from_numpy(np.asarray(ob, dtype = np.float32)).to(device)[None]
-                action = policy(state, goal).mean[0].clamp(-1., 1.).cpu().numpy()
+                action = policy(state, goal).mean[0]
+                if act_mean is not None:
+                    action = action * act_std + act_mean   # back to the env's raw action space
+                action = action.clamp(-1., 1.).cpu().numpy()
                 ob, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 success = float(info['success'])
@@ -200,7 +203,8 @@ def main(
     mrn_normalize_by_dim = True,   # divide the mrn distance by sqrt(latent_dim) (authors' code)
     actor_goal = 'paired',         # 'paired': same-trajectory future goal for the q term (authors' code); 'random': goals permuted across the batch (eq. 15 / pre-branch repo)
     actor_final_init_scale = 0.01, # small init of the actor's mean layer (authors' code); None for the default init
-    gcbc = False                   # goal-conditioned behavior cloning baseline: actor trained with the bc term only, critic not trained
+    gcbc = False,                  # goal-conditioned behavior cloning baseline: actor trained with the bc term only, critic not trained
+    normalize_actions = False      # standardize each action dimension by its dataset mean / std for training; the policy is un-normalized at execution
 ):
     import ogbench
 
@@ -218,13 +222,26 @@ def main(
 
     config = {k: v for k, v in locals().items() if k in (
         'env_name', 'seed', 'alpha', 'steps', 'batch_size', 'lr', 'discount', 'waypoint_discount', 'next_timestep_prob',
-        'latent_dim', 'hidden_dim', 'distance_groups', 'paired_loss_weight', 'action_invariance_loss_weight', 'eval_episodes', 'q_normalize', 'ensemble', 'mrn_normalize_by_dim', 'actor_goal', 'actor_final_init_scale', 'gcbc')}
+        'latent_dim', 'hidden_dim', 'distance_groups', 'paired_loss_weight', 'action_invariance_loss_weight', 'eval_episodes', 'q_normalize', 'ensemble', 'mrn_normalize_by_dim', 'actor_goal', 'actor_final_init_scale', 'gcbc', 'normalize_actions')}
     (out_dir / 'config.json').write_text(json.dumps(config, indent = 2))
 
     import os
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, compact_dataset = True, dataset_dir = os.environ.get('OGBENCH_DATA_DIR', '~/.ogbench/data'))
     data = GPUDataset(train_dataset, device)
     obs_dim, action_dim = data.obs_dim, data.action_dim
+
+    # optional per-dimension action standardization (statistics over transitions that have an action)
+
+    act_mean = act_std = None
+    q_action_clamp = (-1., 1.)
+
+    if normalize_actions:
+        valid_acts = data.acts[data.valid_idxs]
+        act_mean = valid_acts.mean(dim = 0)
+        act_std = valid_acts.std(dim = 0).clamp(min = 1e-3)
+        data.acts = (data.acts - act_mean) / act_std
+        q_action_clamp = ((-1. - act_mean) / act_std, (1. - act_mean) / act_std)   # the env's [-1, 1] bounds in normalized space
+        print('action mean', [round(v, 3) for v in act_mean.tolist()], 'std', [round(v, 3) for v in act_std.tolist()])
     print(f'{env_name}: {len(data.obs)} states, {data.num_episodes} episodes, obs {obs_dim}, act {action_dim}')
 
     mqe = MQE(
@@ -265,7 +282,7 @@ def main(
             bc_loss_weight = alpha,
             normalize_q = q_normalize,
             cross_batch_goals = (actor_goal == 'random'),
-            action_clamp = (-1., 1.)
+            action_clamp = q_action_clamp
         )
 
     if gcbc:
@@ -334,14 +351,14 @@ def main(
 
         if step in eval_steps:
             t0 = time.time()
-            result = evaluate(env, policy, device, eval_episodes)
+            result = evaluate(env, policy, device, eval_episodes, act_mean = None if act_mean is None else act_mean.cpu(), act_std = None if act_std is None else act_std.cpu())
             result['step'] = step
             result['eval_seconds'] = time.time() - t0
             eval_results.append(result)
             (out_dir / 'eval.json').write_text(json.dumps(eval_results, indent = 2))
             print(f'eval @ {step}: ' + '  '.join(f'{k} {v:.3f}' for k, v in result.items() if k.startswith(('task', 'overall'))) + f'  ({result["eval_seconds"]:.0f}s)', flush = True)
 
-            torch.save(dict(mqe = mqe.state_dict(), policy = policy.state_dict(), config = config, step = step), out_dir / f'ckpt_{step}.pt')
+            torch.save(dict(mqe = mqe.state_dict(), policy = policy.state_dict(), config = config, step = step, act_mean = act_mean, act_std = act_std), out_dir / f'ckpt_{step}.pt')
             last_time = time.time()
 
     log_file.close()

@@ -11,7 +11,7 @@ def main(runs_dir = 'runs'):
         if 'smoke' in f.parts:
             continue
         d = json.loads(f.read_text())
-        arm = f.parts[1] if f.parts[1] in ('faithful', 'qnorm', 'gcbc', 'branch') else 'raw'
+        arm = f.parts[1] if f.parts[1] in ('faithful', 'qnorm', 'gcbc', 'branch', 'branch_alpha3', 'branch_alpha10', 'branch_norm', 'gcbc_norm') else 'raw'
         env = f.parts[2] if arm != 'raw' else f.parts[1]
         seed = f.parent.name
         rows.append((env, arm, seed, d['step'], d['spearman_v'], d['spearman_q'], d['monotonic_fraction'], d['action_invariance_steps_mean'], d['action_invariance_steps_p95'], d['calibration']))
